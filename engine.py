@@ -1,6 +1,35 @@
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
+import requests
+import re
+
+def get_domestic_gold_price():
+    """
+    Fetches the domestic gold price (KRX Gold Spot) from Naver Finance.
+    URL: https://m.stock.naver.com/marketindex/metals/M04020000
+    """
+    url = "https://m.stock.naver.com/marketindex/metals/M04020000"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1'
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        # Search for "closePrice":"235,440" or similar
+        match = re.search(r'\"closePrice\":\"([\d,]+)\"', r.text)
+        if match:
+            price_str = match.group(1).replace(',', '')
+            return float(price_str)
+        
+        # Fallback: search for "nv":235440
+        match = re.search(r'\"nv\":(\d+)', r.text)
+        if match:
+            return float(match.group(1))
+            
+    except Exception as e:
+        print(f"Error fetching domestic gold price: {e}")
+    
+    return None
 
 # Target Indices
 TARGET_INDICES = {
@@ -9,18 +38,42 @@ TARGET_INDICES = {
     "S&P500": "^GSPC",
     "NASDAQ": "^IXIC",
     "GOLD": "GC=F",
-    "BITCOIN": "BTC-USD"
+    "BITCOIN": "BTC-USD",
+    "NIKKEI225": "^N225",
+    "SHANGHAI": "000001.SS",
+    "HANGSENG": "^HSI",
+    "UK_FTSE": "^FTSE"
 }
+
+# Stock Universes (Subset for Performance)
+US_UNIVERSE = [
+    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "GOOG", "META", "TSLA", "BRK-B", "UNH",
+    "JNJ", "XOM", "V", "PG", "MA", "AVGO", "HD", "CVX", "LLY", "ABBV",
+    "COST", "PEP", "ADBE", "CSCO", "AMD", "QCOM", "TXN", "INTC", "AMGN", "HON",
+    "INTU", "SBUX", "MDLZ", "ISRG", "GILD", "BKNG", "AMAT", "ADP", "VRTX", "MU"
+]
+
+KR_UNIVERSE = [
+    "005930.KS", "000660.KS", "373220.KS", "207940.KS", "005380.KS", "005935.KS", "000270.KS", "068270.KS", "005490.KS", "105560.KS",
+    "051910.KS", "035420.KS", "000810.KS", "055550.KS", "012330.KS", "028260.KS", "032830.KS", "006400.KS", "035720.KS", "086790.KS",
+    "003550.KS", "066570.KS", "011200.KS", "009150.KS", "015760.KS", "003670.KS", "034730.KS", "017670.KS", "128940.KS", "010130.KS",
+    "011070.KS", "011170.KS", "000720.KS", "005070.KS", "004020.KS", "000100.KS", "011780.KS", "030240.KS", "001040.KS", "003470.KS"
+]
 
 def fetch_data(ticker, period="2y"):
     """
-    Fetches OHLCV data from yfinance.
+    Fetches OHLCV data from yfinance usando Ticker().history for better reliability.
     """
-    df = yf.download(ticker, period=period, progress=False, multi_level_index=False)
-    if df.empty:
+    try:
+        tk = yf.Ticker(ticker)
+        df = tk.history(period=period)
+        if df.empty:
+            return None
+        return df
+    except Exception as e:
+        print(f"Error fetching data for {ticker}: {e}")
         return None
-    # Ensure standard column names if needed, though yfinance usually fits well with pandas_ta
-    return df
+
 
 def analyze_market_phase(df):
     """
@@ -136,14 +189,109 @@ def track_mdd(df):
 
 def calculate_atr(df, length=20):
     """
-    Calculates ATR (N-value) with length 20.
+    Calculates ATR (N-value) with length 20 using EMA smoothing.
+    Uses the latest available data point (iloc[-1]) for real-time tracking.
     """
     if df is None or len(df) < length:
         return None
     
-    # pandas_ta requires High, Low, Close
-    atr = ta.atr(df['High'], df['Low'], df['Close'], length=length)
-    return atr.iloc[-1]
+    # Using mamode='ema' to match popular trading platform calculations (e.g. Kiwoom, TradingView EMA)
+    atr_series = ta.atr(df['High'], df['Low'], df['Close'], length=length, mamode='ema')
+    
+    return atr_series.iloc[-1]
+
+def get_dividend_history(ticker, count=5):
+    """
+    Fetches historical dividend data for a ticker.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        divs = tk.dividends
+        if divs.empty:
+            return None
+        
+        # Sort by date descending and take top N
+        latest_divs = divs.sort_index(ascending=False).head(count)
+        
+        results = []
+        for date, value in latest_divs.items():
+            results.append({
+                "Date": date.strftime("%Y-%m-%d"),
+                "Amount": value
+            })
+        return results
+    except Exception as e:
+        print(f"Error fetching dividends for {ticker}: {e}")
+        return None
+
+def screen_stocks(market_type="US"):
+    """
+    Screens stocks from the universe based on Turtle Strategy criteria.
+    
+    Criteria (US):
+    - 20-day High breakout
+    - SMA5 rising for 2+ days
+    - SMA200 rising for 2+ days
+    - Market Cap >= 100,000M
+    
+    Criteria (KR):
+    - 20-day High breakout
+    - Strength/Volume confirmation (Proxy for Supply)
+    """
+    universe = US_UNIVERSE if market_type == "US" else KR_UNIVERSE
+    results = []
+    
+    for ticker in universe:
+        try:
+            df = yf.download(ticker, period="1y", progress=False, multi_level_index=False)
+            if df is None or len(df) < 200: continue
+            
+            # 1. 20-day High Breakout
+            # Today's high must be the highest in the last 20 days
+            high_20 = df['High'].tail(20)
+            is_20d_high = high_20.iloc[-1] >= high_20.max()
+            
+            if not is_20d_high: continue
+            
+            # 2. SMA Trends (US)
+            sma5 = ta.sma(df['Close'], length=5)
+            sma200 = ta.sma(df['Close'], length=200)
+            
+            sma5_rising = sma5.iloc[-1] > sma5.iloc[-2] > sma5.iloc[-3]
+            sma200_rising = sma200.iloc[-1] > sma200.iloc[-2]
+            
+            # 3. Market Cap / Supply Filters
+            info = yf.Ticker(ticker).info
+            market_cap = info.get('marketCap', 0)
+            
+            if market_type == "US":
+                # Market Cap >= 100,000M (100 Billion)
+                # Note: yfinance cap is in absolute units (USD)
+                if market_cap < 100_000_000_000: continue
+                if not (sma5_rising and sma200_rising): continue
+            else: # KR
+                # Supply Proxy: Volume > 20d Avg Volume + Positive Price Action
+                avg_vol = df['Volume'].tail(20).mean()
+                curr_vol = df['Volume'].iloc[-1]
+                vol_strong = curr_vol > avg_vol
+                if not vol_strong: continue
+                
+            # If all passed, calculate Turtle metrics
+            n_val = calculate_atr(df)
+            
+            results.append({
+                "ticker": ticker,
+                "name": info.get('shortName', ticker),
+                "current_price": df['Close'].iloc[-1],
+                "1N": n_val,
+                "market_cap": market_cap,
+                "status": "Breakout"
+            })
+        except Exception as e:
+            print(f"Error screening {ticker}: {e}")
+            continue
+            
+    return pd.DataFrame(results)
 
 def run_analysis():
     results = {}
